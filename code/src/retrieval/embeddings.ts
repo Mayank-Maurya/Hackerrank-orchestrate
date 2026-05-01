@@ -1,10 +1,10 @@
-// Embedding retrieval. Cosine similarity over Gemini embeddings, with on-disk
-// caching keyed by a hash of (corpus content + model + dim) so we only pay to
-// embed once per corpus version.
+// Embedding retrieval. Cosine similarity over local BGE-small embeddings
+// (see ../embed.ts), with on-disk caching keyed by a hash of
+// (corpus content + model) so we only pay to embed once per corpus version.
 
 import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { embed, modelId } from "../embed.js";
 import type { Chunk } from "../types.js";
@@ -202,6 +202,3 @@ export async function buildEmbeddingIndex(chunks: Chunk[]): Promise<EmbeddingInd
   const vectors = chunks.map((c) => vectorsByPath.get(c.path)!);
   return { chunks, vectors, dim };
 }
-
-// Suppress an unused-var warning on `dirname` in some builds.
-void dirname;

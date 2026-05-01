@@ -43,7 +43,6 @@ async function main() {
   console.log(`[main] reading ${paths.input}`);
   const inputs = await readInputCsv(paths.input);
   console.log(`[main] ${inputs.length} tickets loaded`);
-  console.log(`[main] first ticket: `, inputs[0]);
 
   console.log(`[main] loading corpus`);
   const corpus = await loadCorpus();
