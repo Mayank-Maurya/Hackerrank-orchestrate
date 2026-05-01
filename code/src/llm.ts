@@ -8,6 +8,8 @@ import OpenAI from "openai";
 import type { z, ZodTypeAny } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
+import { stepStart, logSent, logReceived, stepError } from "./logger.js";
+
 let _client: OpenAI | null = null;
 
 export function client(): OpenAI {
@@ -70,8 +72,14 @@ export async function structured<T extends ZodTypeAny>(args: {
 
   await serializeExecution();
 
+  const finish = stepStart("llm", `model=${args.model}`);
+  logSent("llm", {
+    model: args.model,
+    systemLen: `${systemPromptWithSchema.length} chars`,
+    userLen: `${args.user.length} chars`,
+  });
+
   try {
-    console.log('request sent');
     const response = await c.chat.completions.create({
       model: args.model,
       messages: [
@@ -82,7 +90,7 @@ export async function structured<T extends ZodTypeAny>(args: {
       temperature: 0,
       response_format: { type: "json_object" },
     });
-    console.log('response received');
+
 
     const text = response.choices[0]?.message?.content;
 
@@ -96,11 +104,14 @@ export async function structured<T extends ZodTypeAny>(args: {
     } catch {
       throw new Error(`Model returned non-JSON: ${text.slice(0, 200)}`);
     }
-    console.log(raw);
-    return args.schema.parse(raw);
+    const parsed = args.schema.parse(raw);
+    logReceived("llm", parsed as Record<string, unknown>);
+    finish();
+    return parsed;
 
   } catch (error) {
-    console.error(`[llm:structured] Error calling local model ${args.model}:`, error);
+    stepError("llm", `Error calling ${args.model}: ${(error as Error).message}`);
+    finish();
     throw error;
   }
 }

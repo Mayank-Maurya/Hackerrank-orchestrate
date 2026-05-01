@@ -5,6 +5,7 @@
 import { z } from "zod";
 
 import { MODELS, structured } from "../llm.js";
+import { stepStart, logReceived, stepWarn } from "../logger.js";
 import type { Drafted, Retrieved, Validated } from "../state.js";
 import type { ScoredChunk } from "../types.js";
 
@@ -72,6 +73,7 @@ export async function draft(
 ): Promise<Drafted> {
   const baseRetryCount =
     prev.kind === "validated" ? prev.draft.retryCount + 1 : 0;
+  const finish = stepStart("draft", `retry=${baseRetryCount}${retryFeedback ? ` feedback=${retryFeedback.length} claims` : ""}`);
 
   let result: z.infer<typeof DraftLlmSchema>;
   try {
@@ -82,6 +84,8 @@ export async function draft(
       schema: DraftLlmSchema,
     });
   } catch (e) {
+    stepWarn("draft", `LLM failed: ${(e as Error).message}`);
+    finish();
     return {
       kind: "drafted",
       raw: prev.raw,
@@ -93,6 +97,9 @@ export async function draft(
       retryCount: baseRetryCount,
     };
   }
+
+  logReceived("draft", { response: result.response, justification: result.justification });
+  finish();
 
   return {
     kind: "drafted",

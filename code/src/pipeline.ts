@@ -10,6 +10,7 @@ import { draft } from "./nodes/draft.js";
 import { retrieve, type RetrievalContext } from "./nodes/retrieve.js";
 import { triage } from "./nodes/triage.js";
 import { validate } from "./nodes/validate.js";
+import { stepStart, stepDetail } from "./logger.js";
 
 const MAX_DRAFT_RETRIES = 2;
 
@@ -26,7 +27,9 @@ export async function runPipeline(
   // Cap iterations to keep retries from looping. With 6 stages and at most
   // MAX_DRAFT_RETRIES re-drafts, this is plenty.
   const MAX_STEPS = 16;
+  const pipelineFinish = stepStart("pipeline", `ticket starting`);
   for (let step = 0; step < MAX_STEPS; step++) {
+    const finish = stepStart("pipeline", `step ${step}: ${s.kind}`);
     switch (s.kind) {
       case "raw":
         s = await triage(s);
@@ -47,11 +50,16 @@ export async function runPipeline(
         s = await transitionFromValidated(s);
         break;
       case "final":
+        finish();
+        stepDetail("pipeline", "result", `status=${s.status} type=${s.requestType} area=${s.productArea}`);
+        pipelineFinish();
         return s;
       default:
         return assertNever(s);
     }
+    finish();
   }
+  pipelineFinish();
   throw new Error(`Pipeline did not terminate within ${MAX_STEPS} steps`);
 }
 

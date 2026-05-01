@@ -5,6 +5,7 @@
 import { z } from "zod";
 
 import { MODELS, structured } from "../llm.js";
+import { stepStart, logReceived, stepWarn, stepDetail } from "../logger.js";
 import type { Drafted, Validated, ValidationResult } from "../state.js";
 import type { ScoredChunk } from "../types.js";
 
@@ -56,6 +57,7 @@ function buildUserPrompt(d: Drafted): string {
 }
 
 export async function validate(d: Drafted): Promise<Validated> {
+  const finish = stepStart("validate", `retryCount=${d.retryCount}`);
   let result: z.infer<typeof ValidateLlmSchema>;
   try {
     result = await structured({
@@ -65,8 +67,8 @@ export async function validate(d: Drafted): Promise<Validated> {
       schema: ValidateLlmSchema,
     });
   } catch (e) {
-    // If the validator fails, treat the draft as ok rather than escalating —
-    // the validator itself failing is not the user's fault.
+    stepWarn("validate", `LLM failed: ${(e as Error).message} — treating draft as ok`);
+    finish();
     return wrapValidated(d, { kind: "ok" });
   }
 
@@ -85,6 +87,11 @@ export async function validate(d: Drafted): Promise<Validated> {
     validation = { kind: "ok" };
   }
 
+  logReceived("validate", { ok: String(result.ok), unsupported: String(result.unsupported_claims.length), offTopic: result.off_topic_reason ?? "null" });
+  if (result.unsupported_claims.length > 0) {
+    stepDetail("validate", "claims", result.unsupported_claims.join("; "));
+  }
+  finish();
   return wrapValidated(d, validation);
 }
 

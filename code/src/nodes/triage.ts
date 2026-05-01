@@ -5,6 +5,7 @@
 import { z } from "zod";
 
 import { MODELS, structured } from "../llm.js";
+import { stepStart, logSent, logReceived, stepDetail, stepWarn } from "../logger.js";
 import type { RawTicket, Triaged, TriageFlags } from "../state.js";
 
 // Narrowed tier-1 patterns. We dropped `\bstolen\b` and `\brefund\b` from an
@@ -58,6 +59,7 @@ const Tier2Schema = z.object({
 });
 
 export async function triage(raw: RawTicket): Promise<Triaged> {
+  const finish = stepStart("triage", `subject="${raw.input.subject || '(none)'}"`);
   const text = `${raw.input.subject}\n${raw.input.issue}`.trim();
 
   const tier1: TriageFlags = {
@@ -72,7 +74,11 @@ export async function triage(raw: RawTicket): Promise<Triaged> {
   // Hard short-circuit: confirmed prompt injection skips the LLM call entirely
   // — no point asking the model to re-classify content we already know is
   // malicious, and it avoids feeding the injected text into another model.
+  stepDetail("triage", "tier1", JSON.stringify({ injection: tier1.hasInjection, sensitive: tier1.isSensitive, greeting: tier1.isGreeting }));
+
   if (tier1.hasInjection) {
+    stepWarn("triage", "Tier-1 injection detected — skipping LLM");
+    finish();
     return { kind: "triaged", raw, flags: { ...tier1, notes: "tier-1 injection" } };
   }
 
@@ -88,6 +94,8 @@ export async function triage(raw: RawTicket): Promise<Triaged> {
     });
   } catch (e) {
     // If tier-2 fails, fall back to tier-1 only and let downstream handle it.
+    stepWarn("triage", `Tier-2 LLM failed: ${(e as Error).message}`);
+    finish();
     return {
       kind: "triaged",
       raw,
@@ -103,5 +111,7 @@ export async function triage(raw: RawTicket): Promise<Triaged> {
     notes: tier2.reasoning,
   };
 
+  logReceived("triage", { injection: String(flags.hasInjection), sensitive: String(flags.isSensitive), greeting: String(flags.isGreeting), outOfScope: String(flags.isOutOfScope), notes: flags.notes ?? "" });
+  finish();
   return { kind: "triaged", raw, flags };
 }

@@ -11,6 +11,7 @@ import { embeddingSearch } from "../retrieval/embeddings.js";
 import { rrf } from "../retrieval/rrf.js";
 import type { Classified, Retrieved } from "../state.js";
 import type { Chunk, ScoredChunk } from "../types.js";
+import { stepStart, stepDetail, logReceived } from "../logger.js";
 
 export interface RetrievalContext {
   bm25: Bm25Index;
@@ -27,6 +28,7 @@ export async function retrieve(
   c: Classified,
   ctx: RetrievalContext,
 ): Promise<Retrieved> {
+  const finish = stepStart("retrieve", `company=${c.classification.company}`);
   const company =
     c.classification.company === "Unknown"
       ? undefined
@@ -47,6 +49,9 @@ export async function retrieve(
     });
   }
 
+  stepDetail("retrieve", "bm25Hits", `${bm25Hits.length}`);
+  stepDetail("retrieve", "embedHits", `${embedHits.length}`);
+
   const fused = rrf([bm25Hits, embedHits], { topK: TOP_K });
 
   const chunks: ScoredChunk[] = [];
@@ -55,6 +60,12 @@ export async function retrieve(
     if (!ch) continue;
     chunks.push({ ...ch, score: hit.score });
   }
+
+  stepDetail("retrieve", "fusedChunks", `${chunks.length}`);
+  for (const ch of chunks) {
+    stepDetail("retrieve", "chunk", `[${ch.score.toFixed(3)}] ${ch.path} — ${ch.title}`);
+  }
+  finish();
 
   return {
     kind: "retrieved",

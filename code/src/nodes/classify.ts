@@ -7,6 +7,7 @@
 import { z } from "zod";
 
 import { MODELS, structured } from "../llm.js";
+import { stepStart, logReceived, stepDetail, stepWarn } from "../logger.js";
 import type { Classified, Final, Triaged } from "../state.js";
 import { escalate, replyInvalid } from "../state.js";
 import {
@@ -67,8 +68,12 @@ export async function classify(
   t: Triaged,
   ctx: ClassifyContext,
 ): Promise<Classified | Final> {
+  const finish = stepStart("classify", `company_hint=${t.raw.input.company}`);
+
   // ---- Triage-driven early exits --------------------------------------------
   if (t.flags.hasInjection) {
+    stepWarn("classify", "Injection detected → escalate");
+    finish();
     return escalate(
       t.raw.input,
       "Detected prompt injection; escalating instead of complying with embedded instructions.",
@@ -76,6 +81,8 @@ export async function classify(
   }
 
   if (t.flags.isGreeting) {
+    stepDetail("classify", "earlyExit", "greeting → replyInvalid");
+    finish();
     return replyInvalid(
       t.raw.input,
       "Happy to help",
@@ -94,6 +101,8 @@ export async function classify(
       schema: ClassifyLlmSchema,
     });
   } catch (e) {
+    stepWarn("classify", `LLM failed: ${(e as Error).message}`);
+    finish();
     return escalate(
       t.raw.input,
       `Classifier failed: ${(e as Error).message}. Escalating to be safe.`,
@@ -122,6 +131,8 @@ export async function classify(
 
   // Out-of-scope tickets are answered politely with `invalid`, not escalated.
   if (t.flags.isOutOfScope) {
+    stepDetail("classify", "earlyExit", "outOfScope → replyInvalid");
+    finish();
     return replyInvalid(
       t.raw.input,
       "I am sorry, this is out of scope from my capabilities",
@@ -132,6 +143,8 @@ export async function classify(
 
   // Escalation short-circuits straight to Final — no retrieval/drafting.
   if (status === "escalated") {
+    stepDetail("classify", "earlyExit", "escalated");
+    finish();
     return escalate(
       t.raw.input,
       `Classifier marked escalation. Reason: ${result.reasoning}`,
@@ -139,6 +152,8 @@ export async function classify(
     );
   }
 
+  logReceived("classify", { company, productArea, requestType, status, reasoning: result.reasoning });
+  finish();
   return {
     kind: "classified",
     raw: t.raw,
