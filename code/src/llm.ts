@@ -1,6 +1,6 @@
-// Local LiteLLM client + structured-output helper.
+// OpenRouter client + structured-output helper.
 //
-// We use the `openai` SDK pointing to a local LiteLLM endpoint with `response_format: { type: "json_object" }`
+// We use the `openai` SDK pointing to OpenRouter with `response_format: { type: "json_object" }`
 // and a JSON Schema (converted from a Zod schema) injected into the system prompt for structured output. 
 // The SDK returns raw JSON text; we then parse with Zod for runtime validation.
 
@@ -15,24 +15,30 @@ let _client: OpenAI | null = null;
 export function client(): OpenAI {
   if (_client) return _client;
 
-  // LiteLLM requires an API key string, but it can be a dummy value if auth isn't configured
-  const apiKey = process.env.LITELLM_API_KEY || "password";
-  const baseURL = process.env.LITELLM_BASE_URL || "http://192.168.1.8:4000/v1";
+  const apiKey = process.env.OPEN_ROUTER_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "OPEN_ROUTER_KEY not set. Copy code/.env.example to code/.env and fill it in.",
+    );
+  }
 
   _client = new OpenAI({
     apiKey,
-    baseURL
+    baseURL: "https://openrouter.ai/api/v1",
+    defaultHeaders: {
+      "HTTP-Referer": "http://localhost:3000",
+      "X-Title": "HackerRank Orchestrate",
+    }
   });
 
   return _client;
 }
 
 export const MODELS = {
-  // Update these defaults to match the model string in your LiteLLM config
-  triage: () => process.env.LOCAL_TRIAGE_MODEL ?? "ollama/qwen2.5:14b-instruct",
-  classify: () => process.env.LOCAL_CLASSIFY_MODEL ?? "ollama/qwen2.5:14b-instruct",
-  draft: () => process.env.LOCAL_DRAFT_MODEL ?? "ollama/qwen2.5:14b-instruct",
-  validate: () => process.env.LOCAL_VALIDATE_MODEL ?? "ollama/qwen2.5:14b-instruct",
+  triage: () => process.env.OPENROUTER_TRIAGE_MODEL ?? "google/gemini-2.5-flash",
+  classify: () => process.env.OPENROUTER_CLASSIFY_MODEL ?? "google/gemini-2.5-flash",
+  draft: () => process.env.OPENROUTER_DRAFT_MODEL ?? "google/gemini-2.5-flash",
+  validate: () => process.env.OPENROUTER_VALIDATE_MODEL ?? "google/gemini-2.5-flash",
 };
 
 // zod-to-json-schema can emit `$ref`/`definitions` blocks. We inline everything
@@ -46,16 +52,52 @@ function toJsonSchema(schema: ZodTypeAny): Record<string, unknown> {
   return j;
 }
 
-// Local inference handles sequential processing best. 
-// We serialize all calls through a single gate to prevent thrashing the VRAM,
-// but we remove the arbitrary 5-second wait since local hardware dictates the speed.
+// We serialize all calls through a single gate with a small delay to avoid rate limit issues.
+const RATE_LIMIT_MS = 2000;
+let lastCallEndMs = 0;
 let chainTail: Promise<void> = Promise.resolve();
 
-async function serializeExecution(): Promise<void> {
-  const myTurn = chainTail.then(() => Promise.resolve());
+async function rateLimit(): Promise<void> {
+  const myTurn = chainTail.then(async () => {
+    const wait = Math.max(0, lastCallEndMs + RATE_LIMIT_MS - Date.now());
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  });
   chainTail = myTurn;
   await myTurn;
 }
+
+function noteCallEnded(): void {
+  lastCallEndMs = Date.now();
+}
+
+function parseRetryDelaySeconds(err: unknown): number | null {
+  const msg = (err as Error)?.message ?? "";
+  const m = msg.match(/retry in (\d+(?:\.\d+)?)s/i);
+  return m && m[1] ? parseFloat(m[1]) : null;
+}
+
+async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = (e as Error).message ?? "";
+      const isRateLimit = msg.includes("429") || msg.includes("rate limit");
+      if (!isRateLimit || attempt === MAX_ATTEMPTS) throw e;
+      const hinted = parseRetryDelaySeconds(e);
+      const wait = hinted ? hinted * 1000 + 1000 : RATE_LIMIT_MS * attempt;
+      stepError("llm", `[llm:${label}] 429, waiting ${(wait / 1000).toFixed(1)}s (attempt ${attempt})`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw new Error("unreachable");
+}
+
+// OpenRouter models occasionally drop required JSON fields depending on the underlying provider. 
+// We retry up to MAX_SCHEMA_RETRIES times, feeding the prior failure back as additional
+// system context so the model fills in what it missed.
+const MAX_SCHEMA_RETRIES = 2;
 
 export async function structured<T extends ZodTypeAny>(args: {
   model: string;
@@ -66,11 +108,7 @@ export async function structured<T extends ZodTypeAny>(args: {
   const c = client();
   const jsonSchema = toJsonSchema(args.schema);
 
-  // Local models perform best at JSON tasks when the schema is explicitly handed to them
-  // in the system prompt alongside setting the json_object flag.
   const systemPromptWithSchema = `${args.system}\n\nYou must respond ONLY with valid JSON that strictly satisfies this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
-
-  await serializeExecution();
 
   const finish = stepStart("llm", `model=${args.model}`);
   logSent("llm", {
@@ -79,39 +117,64 @@ export async function structured<T extends ZodTypeAny>(args: {
     userLen: `${args.user.length} chars`,
   });
 
-  try {
-    const response = await c.chat.completions.create({
-      model: args.model,
-      messages: [
-        { role: "system", content: systemPromptWithSchema },
-        { role: "user", content: args.user }
-      ],
+  let lastError: Error | null = null;
+  let lastRawText: string | null = null;
 
-      temperature: 0,
-      response_format: { type: "json_object" },
-    });
+  for (let attempt = 0; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
+    const messages: { role: "system" | "user"; content: string }[] = [
+      { role: "system", content: systemPromptWithSchema },
+      { role: "user", content: args.user },
+    ];
 
-
-    const text = response.choices[0]?.message?.content;
-
-    if (!text) {
-      throw new Error("Local model returned an empty response");
+    if (lastError && attempt > 0) {
+      messages.push({
+        role: "system",
+        content: `Your previous response failed schema validation:\n${lastError.message}\n\nPrior raw output (truncated):\n${(lastRawText ?? "").slice(0, 400)}\n\nReply again with valid JSON. Include EVERY required field from the schema. No prose outside the JSON object.`,
+      });
     }
 
-    let raw: unknown;
     try {
-      raw = JSON.parse(text);
-    } catch {
-      throw new Error(`Model returned non-JSON: ${text.slice(0, 200)}`);
-    }
-    const parsed = args.schema.parse(raw);
-    logReceived("llm", parsed as Record<string, unknown>);
-    finish();
-    return parsed;
+      const text = await withRetry(async () => {
+        await rateLimit();
+        try {
+          const response = await c.chat.completions.create({
+            model: args.model,
+            messages,
+            temperature: 0,
+            max_tokens: 6000,
+            response_format: { type: "json_object" },
+          });
+          const t = response.choices[0]?.message?.content;
+          if (!t) throw new Error("OpenRouter returned an empty response");
+          return t;
+        } finally {
+          noteCallEnded();
+        }
+      }, args.model);
 
-  } catch (error) {
-    stepError("llm", `Error calling ${args.model}: ${(error as Error).message}`);
-    finish();
-    throw error;
+      lastRawText = text;
+
+      let raw: unknown;
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        lastError = new Error(`Model returned non-JSON: ${text.slice(0, 200)}`);
+        continue;
+      }
+
+      const parsed = args.schema.parse(raw);
+      logReceived("llm", parsed as Record<string, unknown>);
+      if (attempt > 0) {
+        stepError("llm", `Recovered after ${attempt} schema retr${attempt === 1 ? "y" : "ies"}`);
+      }
+      finish();
+      return parsed;
+    } catch (error) {
+      lastError = error as Error;
+    }
   }
+
+  stepError("llm", `Error calling ${args.model} after ${MAX_SCHEMA_RETRIES + 1} attempts: ${lastError?.message}`);
+  finish();
+  throw lastError ?? new Error("structured() failed without specific error");
 }

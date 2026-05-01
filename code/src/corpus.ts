@@ -10,8 +10,9 @@ import type { Chunk } from "./types.js";
 const DATA_ROOT = new URL("../../data/", import.meta.url).pathname;
 
 /** Minimum character length for a chunk. Shorter sections are merged into the
- *  previous chunk to avoid noisy fragments. */
-const MIN_CHUNK_LENGTH = 80;
+ *  previous chunk. Bumped to 500 to keep total chunk count manageable for
+ *  local CPU embedding while still preserving section-level granularity. */
+const MIN_CHUNK_LENGTH = 500;
 
 const COMPANY_BY_TOP_FOLDER: Record<string, Chunk["company"]> = {
   hackerrank: "HackerRank",
@@ -196,9 +197,17 @@ export async function loadCorpus(): Promise<Chunk[]> {
 // Closed list of product_area values per company, derived from the first level
 // inside each company folder. Useful for the Classify node which constrains
 // LLM output to known values.
+//
+// We filter out top-folder names ("hackerrank", "claude", "visa") which leak
+// into the closed list when files live directly under the company root (e.g.
+// `claude/index.md`). Without this filter, the classifier picks the company
+// name as the product_area instead of a meaningful subfolder.
+const TOP_FOLDER_NAMES = new Set(["hackerrank", "claude", "visa"]);
+
 export function productAreasByCompany(chunks: Chunk[]): Record<string, string[]> {
   const out: Record<string, Set<string>> = {};
   for (const ch of chunks) {
+    if (TOP_FOLDER_NAMES.has(ch.productArea)) continue;
     (out[ch.company] ??= new Set()).add(ch.productArea);
   }
   return Object.fromEntries(
